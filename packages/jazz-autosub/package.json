@@ -6,8 +6,8 @@
     "type": "module",
     "license": "MIT",
     "version": "0.6.1",
-    "dependencies": {
-        "cojson": "workspace:*"
+    "peerDependencies": {
+        "cojson": "workspace:^"
     },
     "scripts": {
         "test": "jest",
@@ -36,8 +36,5 @@
             "/node_modules/",
             "/dist/"
         ]
-    },
-    "devDependencies": {
-        "typescript": "^5.3.3"
     }
 }
