@@ -18,8 +18,14 @@ import {
     Group,
     CoID,
 } from "cojson";
+import {
+    LSMStorage,
+    FileSystem,
+    FSErr,
+    BlockFilename,
+} from "cojson-storage-lsm";
+import { Effect } from "effect";
 import { ReadableStream, WritableStream } from "isomorphic-streams";
-import { IDBStorage } from "cojson-storage-indexeddb";
 import { Resolved } from "jazz-autosub";
 
 export * from "jazz-autosub";
@@ -58,13 +64,233 @@ export async function createBrowserNode({
 
     window.addEventListener("online", onOnline);
 
+
+    const opfsWorkerJSSrc = `
+
+    let rootDirHandle;
+    const handlesByRequest = new Map();
+    const handlesByFilename = new Map();
+
+    onmessage = async (event) => {
+        rootDirHandle = rootDirHandle || await navigator.storage.getDirectory();
+        console.log("Received in OPFS worker", {...event.data, data: event.data.data ? "some data of length " + event.data.data.length : undefined});
+        if (event.data.type === "listFiles") {
+            const fileNames = [];
+            for await (const entry of rootDirHandle.values()) {
+                if (entry.kind === "file") {
+                    fileNames.push(entry.name);
+                }
+            }
+            postMessage({requestId: event.data.requestId, fileNames});
+        } else if (event.data.type === "openToRead" || event.data.type === "openToWrite") {
+            let syncHandle;
+            const existingHandle = handlesByFilename.get(event.data.filename);
+            if (existingHandle) {
+                syncHandle = existingHandle;
+            } else {
+                const handle = await rootDirHandle.getFileHandle(event.data.filename);
+                syncHandle = await handle.createSyncAccessHandle();
+            }
+            handlesByRequest.set(event.data.requestId, syncHandle);
+            handlesByFilename.set(event.data.filename, syncHandle);
+            postMessage({requestId: event.data.requestId, handle: event.data.requestId, size: syncHandle.getSize()});
+        } else if (event.data.type === "createFile") {
+            const handle = await rootDirHandle.getFileHandle(event.data.filename, {
+                create: true,
+            });
+            const syncHandle = await handle.createSyncAccessHandle();
+            handlesByRequest.set(event.data.requestId, syncHandle);
+            handlesByFilename.set(event.data.filename, syncHandle);
+            postMessage({requestId: event.data.requestId, handle: event.data.requestId, result: "done"});
+        } else if (event.data.type === "append") {
+            const writable = handlesByRequest.get(event.data.handle);
+            writable.write(event.data.data, {at: writable.getSize()});
+            writable.flush();
+            postMessage({requestId: event.data.requestId, result: "done"});
+        } else if (event.data.type === "read") {
+            const readable = handlesByRequest.get(event.data.handle);
+            const buffer = new Uint8Array(event.data.length);
+            const read = readable.read(buffer, {at: event.data.offset});
+            if (read < event.data.length) {
+                throw new Error("Couldn't read enough");
+            }
+            postMessage({requestId: event.data.requestId, data: buffer, result: "done"});
+        } else if (event.data.type === "renameAndClose") {
+            const handle = handlesByRequest.get(event.data.handle);
+            const newHandle = await rootDirHandle.getFileHandle(event.data.filename, { create: true });
+            const writable = await newHandle.createSyncAccessHandle();
+            writable.write(handle.read(new Uint8Array(handle.getSize())));
+            writable.flush();
+            writable.close();
+            postMessage({requestId: event.data.requestId, result: "done"});
+        } else {
+            console.error("Unknown event type", event.data.type);
+        }
+    };
+
+    //# sourceURL=opfsWorker.js
+    `;
+
+    const opfsWorker = new Worker(
+        URL.createObjectURL(new Blob([opfsWorkerJSSrc], { type: "text/javascript" }))
+    );
+
+    class OPFSFilesystem
+        implements FileSystem<number, number>
+    {
+        opfsWorker: Worker;
+        callbacks: Map<number, (event: MessageEvent) => void> = new Map();
+        nextRequestId = 0;
+
+        constructor(opfsWorker: Worker) {
+            this.opfsWorker = opfsWorker;
+            opfsWorker.onmessage = (event) => {
+                // console.log("Received from OPFS worker", event.data);
+                const handler = this.callbacks.get(event.data.requestId);
+                if (handler) {
+                    handler(event);
+                    this.callbacks.delete(event.data.requestId);
+                }
+            }
+        }
+
+        listFiles(): Effect.Effect<string[], FSErr, never> {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, (event) => {
+                    cb(Effect.succeed(event.data.fileNames));
+                });
+                this.opfsWorker.postMessage({type: "listFiles", requestId});
+            });
+        }
+
+        openToRead(
+            filename: string
+        ): Effect.Effect<
+            { handle: number; size: number },
+            FSErr,
+            never
+        > {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, (event) => {
+                    cb(
+                        Effect.succeed({
+                            handle: event.data.handle,
+                            size: event.data.size,
+                        })
+                    );
+                });
+                this.opfsWorker.postMessage({
+                    type: "openToRead",
+                    filename,
+                    requestId,
+                });
+            });
+        }
+
+        createFile(
+            filename: string
+        ): Effect.Effect<number, FSErr, never> {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, (event) => {
+                    cb(Effect.succeed(event.data.handle));
+                });
+                this.opfsWorker.postMessage({
+                    type: "createFile",
+                    filename,
+                    requestId,
+                });
+            });
+        }
+
+        openToWrite(
+            filename: string
+        ): Effect.Effect<FileSystemFileHandle, FSErr, never> {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, (event) => {
+                    cb(Effect.succeed(event.data.handle));
+                });
+                this.opfsWorker.postMessage({
+                    type: "openToWrite",
+                    filename,
+                    requestId,
+                });
+            });
+        }
+
+        append(
+            handle: number,
+            data: Uint8Array
+        ): Effect.Effect<void, FSErr, never> {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, (_) => {
+                    cb(Effect.succeed(undefined));
+                });
+                this.opfsWorker.postMessage({
+                    type: "append",
+                    handle,
+                    data,
+                    requestId,
+                });
+            });
+        }
+
+        read(
+            handle: number,
+            offset: number,
+            length: number
+        ): Effect.Effect<Uint8Array, FSErr, never> {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, (event) => {
+                    cb(Effect.succeed(event.data.data));
+                });
+                this.opfsWorker.postMessage({
+                    type: "read",
+                    handle,
+                    offset,
+                    length,
+                    requestId,
+                });
+            });
+        }
+
+        renameAndClose(
+            handle: number,
+            filename: BlockFilename
+        ): Effect.Effect<void, FSErr, never> {
+            return Effect.async((cb) => {
+                const requestId = this.nextRequestId++;
+                this.callbacks.set(requestId, () => {
+                    cb(Effect.succeed(undefined));
+                });
+                this.opfsWorker.postMessage({
+                    type: "renameAndClose",
+                    handle,
+                    filename,
+                    requestId,
+                });
+            });
+        }
+    }
+
     const node = await auth.createNode(
         (accountID) => {
             const sessionHandle = getSessionHandleFor(accountID);
             sessionDone = sessionHandle.done;
             return sessionHandle.session;
         },
-        [await IDBStorage.asPeer(), firstWsPeer],
+        [
+            await LSMStorage.asPeer({
+                fs: new OPFSFilesystem(opfsWorker),
+                trace: true,
+            }),
+            firstWsPeer,
+        ],
         migration
     );
 
@@ -235,7 +461,7 @@ function websocketReadableStream<T>(ws: WebSocket) {
                         received: Date.now(),
                         sent: msg.time,
                         dc: msg.dc,
-                    })
+                    });
                     return;
                 }
                 controller.enqueue(msg);
@@ -428,7 +654,7 @@ export function consumeInviteLinkFromWindowLocation<C extends CoValue>(
 }
 
 export async function createBinaryStreamFromBlob<
-    C extends BinaryCoStream<BinaryCoStreamMeta>
+    C extends BinaryCoStream<BinaryCoStreamMeta>,
 >(
     blob: Blob | File,
     inGroup: Group | Resolved<Group>,
@@ -485,7 +711,7 @@ export async function createBinaryStreamFromBlob<
 }
 
 export async function readBlobFromBinaryStream<
-    C extends BinaryCoStream<BinaryCoStreamMeta>
+    C extends BinaryCoStream<BinaryCoStreamMeta>,
 >(
     streamId: CoID<C>,
     node: LocalNode,

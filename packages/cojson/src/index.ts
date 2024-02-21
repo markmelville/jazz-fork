@@ -25,6 +25,7 @@ import {
     secretSeedLength,
     shortHashLength,
     cryptoReady,
+    StreamingHash
 } from "./crypto.js";
 import { connectedPeers } from "./streamUtils.js";
 import {
@@ -82,7 +83,8 @@ export const cojsonInternals = {
     accountOrAgentIDfromSessionID,
     isAccountID,
     accountHeaderForInitialAgentSecret,
-    idforHeader
+    idforHeader,
+    StreamingHash
 };
 
 export {
